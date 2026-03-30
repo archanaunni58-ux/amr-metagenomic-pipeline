@@ -1,0 +1,137 @@
+#!/bin/bash
+set -e
+
+# =========================
+# Metagenomic AMR Analysis Pipeline
+# =========================
+
+# Step 1: Download data
+prefetch --option-file selected_files.txt
+
+
+# Step 2: Convert SRA to FASTQ
+mkdir -p fastq_files
+
+while read srr
+do
+  fasterq-dump "$srr" -O fastq_files
+done < selected_files.txt
+
+
+# Step 3: Compress FASTQ files
+for file in fastq_files/*.fastq
+do
+  gzip "$file"
+done
+
+
+# Step 4: Quality control (fastp)
+conda activate metagenomics
+
+mkdir -p trimmed qc
+
+for r1 in fastq_files/*_1.fastq.gz; do
+    r2=${r1/_1.fastq.gz/_2.fastq.gz}
+    base=$(basename $r1 _1.fastq.gz)
+
+    fastp \
+      -i $r1 \
+      -I $r2 \
+      -o trimmed/${base}_1.trim.fastq.gz \
+      -O trimmed/${base}_2.trim.fastq.gz \
+      --detect_adapter_for_pe \
+      --qualified_quality_phred 20 \
+      --unqualified_percent_limit 40 \
+      --length_required 50 \
+      --low_complexity_filter \
+      --complexity_threshold 30 \
+      -h qc/${base}_fastp.html \
+      -j qc/${base}_fastp.json \
+      -w 8
+done
+
+
+# Step 5: Host removal (Kneaddata)
+conda activate kneaddata_env
+
+kneaddata_database --download human_genome bowtie2 kneaddata_db
+
+mkdir -p host_removed logs
+
+for r1 in trimmed/*_1.trim.fastq.gz; do
+    base=$(basename $r1 _1.trim.fastq.gz)
+    r2=trimmed/${base}_2.trim.fastq.gz
+
+    kneaddata \
+      -i1 $r1 \
+      -i2 $r2 \
+      -db kneaddata_db \
+      -o host_removed/${base} \
+      --output-prefix ${base} \
+      -t 8 \
+      --remove-intermediate-output \
+      --log logs/${base}_kneaddata.log
+done
+
+
+# Step 6: Assembly (MetaSPAdes)
+conda activate metagenomics
+
+for r1 in host_removed/*/*_paired_1.fastq; do
+    base=$(basename $r1 _paired_1.fastq)
+    r2=$(dirname $r1)/${base}_paired_2.fastq
+
+    metaspades.py \
+      -1 $r1 \
+      -2 $r2 \
+      -o ${base}_metaspades \
+      --threads 16 \
+      --meta
+done
+
+
+# Step 7: Kraken2 classification
+for contig in *_metaspades/contigs.fasta; do
+    base=$(basename $(dirname $contig))
+
+    kraken2 \
+      --db /media/dbt-server-tg-lab/hdd1/PSH/cusat/SECG_Metagenome/CSIX240097/kraken2_db \
+      --classified-out ${base}_classified.fasta \
+      --unclassified-out ${base}_unclassified.fasta \
+      --output ${base}_kraken.txt \
+      --report ${base}_report.txt \
+      $contig
+done
+
+
+# Step 8: DIAMOND blastx
+for contig in *_metaspades/contigs.fasta; do
+    base=$(basename $(dirname $contig))
+
+    diamond blastx \
+      -d /media/dbt-server-tg-lab/hdd1/diamond_db/nr_db.dmnd \
+      -q $contig \
+      -a ${base}.daa \
+      --evalue 1e-5 \
+      --threads 16
+
+    diamond view \
+      -a ${base}.daa \
+      -o ${base}.txt
+done
+
+
+# Step 9: MEGAN (manual visualization step)
+# Open output files in MEGAN for visualization
+
+
+# Step 10: RGI (AMR gene detection)
+conda activate rgi
+
+for contig in *_metaspades/contigs.fasta; do
+    base=$(basename $(dirname $contig))
+
+    rgi main \
+      -i $contig \
+      --output_file ${base}_rgi.txt
+done
